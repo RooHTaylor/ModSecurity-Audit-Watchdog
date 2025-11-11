@@ -237,18 +237,21 @@ fn open_output_file(filepath: &PathBuf) -> Result<Arc<Mutex<File>>, String> {
     Ok(file)
 }
 
+// lazy load the regex for section headers
 static SECTION_HEAD_REGEX: Lazy<Regex> = Lazy::new(|| {
     Regex::new(
         r#"^---(?P<tid>[a-zA-Z0-9]{8})---(?P<section>[A-Z])--"#
     ).unwrap()
 });
 
+// lazy load the regex for section A (connection summary)
 static SUMMARY_A_REGEX: Lazy<Regex> = Lazy::new(|| {
     Regex::new(
-        r#"^\[(?P<datetime>[\w/:\s\-]+)\]\s[0-9]+\.[0-9]+\s(?P<ip>(?:(?:(?:[0-9]{1,2}|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}(?:[0-9]{1,2}|1[0-9]{2}|2[0-4][0-9]|25[0-5]))|(?:(?:[a-fA-F0-9]{1,4}:){1,7}:?[a-fA-F0-9]{1,4}))\s[0-9]+\s(?:(?:(?:(?:[0-9]{1,2}|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}(?:[0-9]{1,2}|1[0-9]{2}|2[0-4][0-9]|25[0-5]))|(?:(?:[a-fA-F0-9]{1,4}:){1,7}:?[a-fA-F0-9]{1,4}))\s[0-9]+"#
+        r#"^\[(?P<datetime>[0-9]{1,2}/[A-Za-z]{3}/[0-9]{4}:[0-9]{1,2}:[0-9]{1,2}:[0-9]{1,2}\s[0-9\-]+)\]\s[0-9]+\.[0-9]+\s(?P<ip>(?:(?:(?:[0-9]{1,2}|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}(?:[0-9]{1,2}|1[0-9]{2}|2[0-4][0-9]|25[0-5]))|(?:(?:[a-fA-F0-9]{1,4}:){1,7}:?[a-fA-F0-9]{1,4}))\s[0-9]+\s(?:(?:(?:(?:[0-9]{1,2}|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}(?:[0-9]{1,2}|1[0-9]{2}|2[0-4][0-9]|25[0-5]))|(?:(?:[a-fA-F0-9]{1,4}:){1,7}:?[a-fA-F0-9]{1,4}))\s[0-9]+"#
     ).unwrap()
 });
 
+// Parse a file using a PathBuf. Fail quickly if it doesn't look like an audit file.
 fn parse_audit_file(filepath: &PathBuf) -> Result<(), String> {
     trace!("Parsing audit file {:?}", filepath);
 
@@ -263,6 +266,7 @@ fn parse_audit_file(filepath: &PathBuf) -> Result<(), String> {
     // Buffer read the output to save on memory and time. Logs can get BIG
     let reader = BufReader::new(file);
 
+    let mut section: Option<Section> = None;
     for line_result in reader.lines() {
         let line = match line_result {
             Ok(l) => l,
@@ -271,9 +275,78 @@ fn parse_audit_file(filepath: &PathBuf) -> Result<(), String> {
                 continue;
             }
         };
-        // Parse or process line here
-        println!("{}", line);
+
+        // Skip empty lines
+        if line.trim().is_empty() {
+            trace!("Empty line");
+            continue;
+        }
+
+        // Check if the line is a section header and parse the new section
+        if SECTION_HEAD_REGEX.is_match(line.trim()) {
+            trace!("Section header match");
+            // Safe to use unwrap here, because we already check for a match
+            let caps = SECTION_HEAD_REGEX
+                .captures(line.trim())
+                .unwrap();
+            debug!("Section {}", &caps["section"]);
+            section = match &caps["section"] {
+                "A" => Some(Section::A),
+                "B" => Some(Section::B),
+                "C" => Some(Section::C),
+                "D" => Some(Section::D),
+                "E" => Some(Section::E),
+                "F" => Some(Section::F),
+                "G" => Some(Section::G),
+                "H" => Some(Section::H),
+                "I" => Some(Section::I),
+                "J" => Some(Section::J),
+                "K" => Some(Section::K),
+                "Z" => None,
+                _ => {
+                    debug!(
+                        "Invalid section letter {:?}",
+                         caps["section"].to_string()
+                    );
+                    continue;
+                }
+            };
+            continue;
+        }
+
+        match section {
+            Some(Section::A) => {
+                trace!("Processing section A");
+                if SUMMARY_A_REGEX.is_match(line.trim()) {
+                    trace!("Connection summary match!");
+                    // Safe to use unwrap here, because we already check for a match
+                    let caps = SUMMARY_A_REGEX
+                        .captures(line.trim())
+                        .unwrap();
+                    debug!("{:?}", caps);
+                }
+            },
+            _ => {
+                continue;
+            }
+        }
+
     }
 
     Ok(())
+}
+
+enum Section {
+    A, // Audit log header (mandatory).
+    B, //Request headers.
+    C, //Request body.
+    D, //Reserved for intermediary response headers; not implemented yet.
+    E, //Intermediary response body
+    F, //Final response headers
+    G, //Reserved for the actual response body; not implemented yet.
+    H, //Audit log trailer.
+    I, //This part has not been implemented in ModSecurity v3.
+    J, //This part contains information about the files uploaded using multipart/form-data encoding.
+    K, // This part has not been implemented in ModSecurity v3.
+    _Z, // Final boundary, signifies the end of the entry (mandatory).
 }
