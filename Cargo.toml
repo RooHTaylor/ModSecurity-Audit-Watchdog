@@ -1,0 +1,14 @@
+[package]
+name = "modsecurity-audit-watchdog"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+clap = { version = "4.5.51", features = ["derive"] }
+crossbeam-channel = "0.5.15"
+env_logger = "0.11.8"
+log = "0.4.28"
+notify = "8.2.0"
+notify-debouncer-full = "0.6.0"
+once_cell = "1.21.3"
+regex = "1.12.2"
