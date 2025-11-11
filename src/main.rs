@@ -1,20 +1,27 @@
 use clap::Parser;
 use std::{
-    fs::{File,OpenOptions},
+    fs::{
+        File, OpenOptions
+    },
     path::PathBuf,
     sync::{
-        Arc,
-        Mutex,
-        mpsc,
+        Arc, Mutex, mpsc,
+        atomic::{AtomicBool, Ordering}
     },
-    thread,
+    thread, process,
     time::Duration,
-    io::{BufRead, BufReader}
+    io::{
+        BufRead, BufReader
+    }
 };
-use log::{error, info, debug, trace};
+use log::{
+    error, info, debug, trace
+};
 use notify_debouncer_full::{
     new_debouncer,
-    notify::{RecursiveMode, EventKind, event::ModifyKind, event::CreateKind}
+    notify::{
+        RecursiveMode, EventKind, event::ModifyKind, event::CreateKind
+    }
 };
 use regex::Regex;
 use once_cell::sync::Lazy;
@@ -59,8 +66,30 @@ fn main() -> Result<(), ()> {
     info!("Log level: {}", log_level);
     debug!("Arguments: {:?}", args);
 
+    let running = Arc::new(AtomicBool::new(true));
+    let first_interrupt = Arc::new(AtomicBool::new(true));
+
+    {
+        let running = Arc::clone(&running);
+        let first_interrupt = Arc::clone(&first_interrupt);
+        ctrlc::set_handler(move || {
+            if first_interrupt.swap(false, Ordering::SeqCst) {
+                info!("\nGraceful shutdown requested (Ctrl+C). Finishing remaining work...");
+                running.store(false, Ordering::SeqCst);
+            } else {
+                error!("Force quitting!");
+                process::exit(1);
+            }
+        }).expect("Error setting Ctrl-C handler");
+    }
+
     // Leave main to execute the program. Return a Result.
-    let result = match begin_watching(args.input, args.output, args.threads) {
+    let result = match begin_watching(
+        args.input,
+        args.output,
+        args.threads,
+        running
+    ) {
         Ok(_) => Ok(()),
         Err(e) => {
             error!("{}", e);
@@ -77,7 +106,12 @@ fn main() -> Result<(), ()> {
 //    new or modified files at the input.
 // Pass notification paths to the crossbeam_channel to be picked up by threads
 // TODO: implement parse function to parse file (from a last point if input is file)
-fn begin_watching(input: PathBuf, output: PathBuf, num_threads_arg: Option<u8>) -> Result<(), String> {
+fn begin_watching(
+    input: PathBuf,
+    output: PathBuf,
+    num_threads_arg: Option<u8>,
+    running: Arc<AtomicBool>,
+) -> Result<(), String> {
     
     // Check if the file or folder exists.
     let input_string = input.to_string_lossy().to_string();
@@ -126,13 +160,18 @@ fn begin_watching(input: PathBuf, output: PathBuf, num_threads_arg: Option<u8>) 
     for i in 0..num_threads {
         let r = receiver.clone();
         let out_file = output_file.clone();
+        let running_clone = running.clone();
         
         let handle = thread::spawn(move || {
             trace!("[Thread {}] Worker started.", i);
-            while let Ok(job_path) = r.recv() {
-                // TODO: Process path notification
-                info!("[Thread {}] Got a new notification for: {}", i, job_path.to_string_lossy());
-                let _ = parse_audit_file(&job_path);
+            while running_clone.load(Ordering::SeqCst) {
+                match r.recv_timeout(Duration::from_secs(1)) {
+                    Ok(job_path) => {
+                        info!("[Thread {}] Got a new notification for: {}", i, job_path.to_string_lossy());
+                        let _ = parse_audit_file(&job_path);
+                    },
+                    Err(_) => continue,
+                }
             }
             trace!("[Thread {}] Worker shutting down.", i);
         });
@@ -167,43 +206,45 @@ fn begin_watching(input: PathBuf, output: PathBuf, num_threads_arg: Option<u8>) 
     info!("Watching {} ", input_string);
 
     // Loop over rx results for notify events
-    for result in rx {
-        match result {
-            Ok(events) => {
-                trace!("Got debounced events {:?}", events);
-                // Due to the debounce, we will get a list of events
-                // Loop over each event to check them
-                for db_event in events {
-                    trace!("Looking at debounced event: {:?}", db_event);
-                    let event = db_event.event;
-                    
-                    // We want anything new or anything changed
-                    if event.kind == EventKind::Create(
-                        CreateKind::Any
-                    ) || event.kind == EventKind::Modify(
-                        ModifyKind::Any
-                    ) {
-                        debug!("Found relevant event: {:?}", event);
-                        for path in &event.paths {
-                            trace!("Looking at path {:?}", path);
-                            match sender.send(path.clone()) {
-                                Ok(_) => {
-                                    debug!("Event path queued.");
-                                },
-                                Err(e) => {
-                                    debug!(
-                                        "Error queuing event path {}",
-                                        path.to_string_lossy());
-                                    trace!("{:?}", e);
+    while running.load(Ordering::SeqCst) {
+        if let Ok(result) = rx.recv_timeout(Duration::from_secs(1)) {
+            match result {
+                Ok(events) => {
+                    trace!("Got debounced events {:?}", events);
+                    // Due to the debounce, we will get a list of events
+                    // Loop over each event to check them
+                    for db_event in events {
+                        trace!("Looking at debounced event: {:?}", db_event);
+                        let event = db_event.event;
+                        
+                        // We want anything new or anything changed
+                        if event.kind == EventKind::Create(
+                            CreateKind::Any
+                        ) || event.kind == EventKind::Modify(
+                            ModifyKind::Any
+                        ) {
+                            debug!("Found relevant event: {:?}", event);
+                            for path in &event.paths {
+                                trace!("Looking at path {:?}", path);
+                                match sender.send(path.clone()) {
+                                    Ok(_) => {
+                                        debug!("Event path queued.");
+                                    },
+                                    Err(e) => {
+                                        debug!(
+                                            "Error queuing event path {}",
+                                            path.to_string_lossy());
+                                        trace!("{:?}", e);
+                                    }
                                 }
                             }
                         }
                     }
+                },
+                Err(e) => {
+                    debug!("Watch error!");
+                    trace!("{:?}", e);
                 }
-            },
-            Err(e) => {
-                debug!("Watch error!");
-                trace!("{:?}", e);
             }
         }
     }
@@ -314,6 +355,7 @@ fn parse_audit_file(filepath: &PathBuf) -> Result<(), String> {
             continue;
         }
 
+        // TODO: capture information and write it out to log file.
         match section {
             Some(Section::A) => {
                 trace!("Processing section A");
