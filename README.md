@@ -1,8 +1,3 @@
-### NOTICE
-
-The develop branch is under active development and breaking changes may be 
-pushed. Stable versions will be available as releases or in the main branch.
-
 # ModSecurity-Audit-Watchdog
 
 A simple log translator in Rust. ModSecurity audit logs are difficult to use on 
