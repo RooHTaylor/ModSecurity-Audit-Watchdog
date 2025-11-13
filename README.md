@@ -55,5 +55,8 @@ Binaries will be available in `target/release/`
 |:-:|-|
 | `-i PATH`<br>`--input PATH` | A path to monitor for audit logfiles. Can be a file or a folder. |
 | `-o PATH`<br>`--output PATH` | The output log file path. |
+| `-p` | Trust X-Forwarded-For to provide client ip. If you're going to use this flag it's highly recommended to use `--trusted-proxies` as well. |
+| `--trusted-proxies` | A comma separated list of ip addresses or ranges in CIDR notation to "trust" as upstream proxies. |
+| `-cf` | If you're using CloudFlare, they add `CF-Connecting-IP` headers that contain the client IP. |
 | `[-t N]` | The number of threads to use to process files. Only applies when input is a directory. Files are processed with a single thread. |
 | `[-d]` | Toggle debug output. Supply multiple times to increase verbosity. ERROR (Default) -> INFO -> DEBUG -> TRACE |

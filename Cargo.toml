@@ -4,10 +4,13 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+chrono = { version = "0.4.42", features = ["clock"] }
 clap = { version = "4.5.51", features = ["derive"] }
 crossbeam-channel = "0.5.15"
 ctrlc = "3.5.1"
 env_logger = "0.11.8"
+ipnet = "2.11.0"
+iprange = "0.6.7"
 log = "0.4.28"
 notify = "8.2.0"
 notify-debouncer-full = "0.6.0"
