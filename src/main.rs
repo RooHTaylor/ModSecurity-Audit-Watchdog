@@ -1,21 +1,14 @@
 use clap::Parser;
 use std::{
-    fs::{
-        File, OpenOptions,
-    },
-    io::{
+    fmt, fs::{
+        self, File, OpenOptions
+    }, io::{
         BufRead, BufReader, Write,
-    },
-    sync::{
-        Arc, Mutex, mpsc,
-        atomic::{
+    }, net::IpAddr, path::PathBuf, process, sync::{
+        Arc, Mutex, atomic::{
             AtomicBool, Ordering,
-        },
-    },
-    net::{
-        IpAddr,
-    },
-    thread, time::Duration, fmt, path::PathBuf, process,
+        }, mpsc
+    }, thread, time::Duration
 };
 use log::{
     error, info, debug, trace,
@@ -23,7 +16,7 @@ use log::{
 use notify_debouncer_full::{
     new_debouncer,
     notify::{
-        RecursiveMode, EventKind, event::ModifyKind, event::CreateKind
+        RecursiveMode, EventKind,
     },
 };
 use regex::Regex;
@@ -51,6 +44,10 @@ struct Args {
     #[arg(short, long)]
     output: PathBuf,
 
+    /// Delete audit files after parsing (only in directory mode)
+    #[arg(long, default_value_t = false)]
+    delete: bool,
+
     /// We're behind a proxy
     #[arg(short, default_value_t = false)]
     proxy: bool,
@@ -65,7 +62,7 @@ struct Args {
 
     /// Number of threads to use. (File mode ONLY)
     #[arg(short)]
-    threads: Option<u8>,
+    threads: Option<usize>,
 
     /// Toggle debug messages (INFO, DEBUG, TRACE) (-d -dd -ddd)
     #[arg(short, default_value_t = 0, action = clap::ArgAction::Count)]
@@ -126,6 +123,7 @@ fn main() -> Result<(), ()> {
     let result = match begin_watching(
         args.input,
         args.output,
+        args.delete,
         args.proxy,
         trusted_proxies,
         args.cf,
@@ -152,10 +150,11 @@ fn main() -> Result<(), ()> {
 fn begin_watching(
     input: PathBuf,
     output: PathBuf,
+    delete: bool,
     proxy: bool,
     trusted_proxies: (IpRange<Ipv4Net>, IpRange<Ipv6Net>),
     cf_headers: bool,
-    num_threads_arg: Option<u8>,
+    num_threads_arg: Option<usize>,
     running: Arc<AtomicBool>,
 ) -> Result<(), String> {
     
@@ -191,7 +190,9 @@ fn begin_watching(
     let num_threads = if input.is_dir() {
         let num_threads = match num_threads_arg {
             Some(n) => n,
-            None => 4,
+            None => thread::available_parallelism()
+                .map(|p| p.get())
+                .unwrap_or(1),
         };
         debug!("Input is a directory. Running {} threads.", num_threads);
         num_threads
@@ -207,6 +208,7 @@ fn begin_watching(
     let trusted_proxies_arc = Arc::new(trusted_proxies);
     let cf_headers_arc = Arc::new(cf_headers);
     let proxy_arc = Arc::new(proxy);
+    let input_arc = Arc::new(input.clone());
 
     for i in 0..num_threads {
         let r = receiver.clone();
@@ -215,6 +217,7 @@ fn begin_watching(
         let trusted_proxies_clone = Arc::clone(&trusted_proxies_arc);
         let cf_headers_clone = cf_headers_arc.clone();
         let proxy_clone = proxy_arc.clone();
+        let input_clone = input_arc.clone();
         
         let handle = thread::spawn(move || {
             trace!("[Thread {}] Worker started.", i);
@@ -233,15 +236,31 @@ fn begin_watching(
                         // Parse the path we pulled out of the queue. This will
                         // either give us a LogMessage that we can write to the
                         // output file, or an Error message.
-                        let result = parse_audit_file(&job_path, &proxy_clone, &trusted_proxies_clone, &cf_headers_clone, &out_file);
-                        match result {
-                            Ok(_) => {
-                                
-                            }, Err(e) => {
-                                // Only trace log here, as there may not have been
-                                // an actual problem. Could have just not been an
-                                // audit file. Debug log in the function itself.
-                                trace!("{:?}", e);
+
+                        if job_path.is_file() {
+                            trace!("{} is a file!", job_path.to_string_lossy());
+                            match  parse_audit_file(
+                                &job_path,
+                                &proxy_clone,
+                                &trusted_proxies_clone,
+                                &cf_headers_clone,
+                                &out_file
+                            ) {
+                                Ok(_) => {
+                                    if job_path.is_file() && input_clone.is_dir() && delete {
+                                        match delete_audit_file(&job_path, &input_clone) {
+                                            Ok(_) => {},
+                                            Err(e) => {
+                                                trace!("{:?}", e);
+                                            }
+                                        }
+                                    }
+                                }, Err(e) => {
+                                    // Only trace log here, as there may not have been
+                                    // an actual problem. Could have just not been an
+                                    // audit file. Debug log in the function itself.
+                                    trace!("{:?}", e);
+                                }
                             }
                         }
                     },
@@ -305,11 +324,9 @@ fn begin_watching(
                         let event = db_event.event;
                         
                         // We want anything new or anything changed
-                        if event.kind == EventKind::Create(
-                            CreateKind::Any
-                        ) || event.kind == EventKind::Modify(
-                            ModifyKind::Any
-                        ) {
+                        if matches!(event.kind, EventKind::Create(_))
+                            || matches!(event.kind, EventKind::Modify(_))
+                        {
                             debug!("Found relevant event: {:?}", event);
                             // Send each path into the thread pool queue
                             for path in &event.paths {
@@ -382,10 +399,26 @@ static SECTION_HEAD_REGEX: Lazy<Regex> = Lazy::new(|| {
 });
 
 // Lazy load the regex for section A (connection summary)
-// Named capture groups: datetime, ip
+// Named capture groups: datetime, ip, sip
 static SUMMARY_A_REGEX: Lazy<Regex> = Lazy::new(|| {
     Regex::new(
-        r#"^(?i)\[(?P<datetime>[0-9]{1,2}/[a-z]{3}/[0-9]{4}:[0-9]{1,2}:[0-9]{1,2}:[0-9]{1,2}\s[0-9\-]+)\]\s[0-9]+\.[0-9]+\s(?P<ip>(?:[0-9\.]+|[0-9a-f:]+))\s[0-9]+\s(?:(?:[0-9\.]+|[0-9a-f:]+))\s[0-9]+$"#
+        r#"^(?i)\[(?P<datetime>[0-9]{1,2}/[a-z]{3}/[0-9]{4}:[0-9]{1,2}:[0-9]{1,2}:[0-9]{1,2}\s[0-9\-]+)\]\s[0-9]+\.[0-9]+\s(?P<ip>(?:[0-9\.]+|[0-9a-f:]+))\s[0-9]+\s(?:(?P<sip>[0-9\.]+|[0-9a-f:]+))\s[0-9]+$"#
+    ).unwrap()
+});
+
+// Lazy load the regex for section B (Request line)
+// Named capture groups: uri
+static REQUEST_B_REGEX: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(
+        r#"^(?i)(?:get|head|post|put|delete|connect|options|trace|patch)\s+(?P<uri>/\S+)\s+.*$"#
+    ).unwrap()
+});
+
+// Lazy load the regex for section B (host line)
+// Named capture groups: host
+static HOST_B_REGEX: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(
+        r#"^(?i)host:\s*(?P<host>\S+)$"#
     ).unwrap()
 });
 
@@ -423,7 +456,7 @@ fn parse_audit_file(
     cf_headers: &Arc<bool>,
     out_file: &Arc<Mutex<File>>,
 ) -> Result<(), String> {
-    trace!("Parsing audit file {:?}", filepath);
+    trace!("Parsing file {:?}", filepath);
 
     // Open the file to read
     let file = match File::open(filepath) {
@@ -439,10 +472,13 @@ fn parse_audit_file(
     // The captures we need
     let mut datetime: Option<DateTime<chrono::FixedOffset>> = None;
     let mut client_ip: Option<IpAddr> = None;
+    let mut host: Option<String> = None;
+    let mut uri: Option<String> = None;
     let mut messages: Vec<String> = Vec::new();
     let mut cfip_match: bool = false; // Client IP set from CF-Connecting-IP
     let mut xffip_list: Vec<IpAddr> = Vec::new(); // List of IPs from X-Forwarded-For
 
+    let mut found_section: bool = false;
     let mut section: Option<Section> = None;
     // Loop over the buffered lines
     for line_result in reader.lines() {
@@ -464,6 +500,7 @@ fn parse_audit_file(
         // Check if the line is a section header
         if SECTION_HEAD_REGEX.is_match(line.trim()) {
             trace!("Section header match");
+            found_section = true;
             // Safe to use unwrap on captures() here because we already confirmed
             // a match above.
             let caps = SECTION_HEAD_REGEX
@@ -587,17 +624,15 @@ fn parse_audit_file(
                     if let Some(ip) = client_ip {
                         debug!("Set client ip to {} based on connection IP", ip);
                     }
+
+                    // Set the host to an initial value (the server ip)
+                    host = Some(caps["sip"].to_string());
                 }
             },
             Some(Section::B) => {
                 // We're in section B.  We should be looking for x-forwarded-for
                 // HTTP headers, to see if there is a more accurate client-ip
                 trace!("Processing section B");
-
-                if !**proxy {
-                    debug!("We aren't behind a proxy, so there's nothing we need in B");
-                    continue;
-                }
 
                 // Check for CF-Connecting-IP header if args flag is set
                 // Check for X-Forwarded-For headers. Collect into a list and at
@@ -606,7 +641,7 @@ fn parse_audit_file(
 
                 // Check for CF-Connecting-IP and X-Forwarded-For if we don't
                 // have it or a bettern match
-                if **cf_headers && !cfip_match {
+                if **proxy && **cf_headers && !cfip_match {
                     trace!("No CF-Connecting-IP found yet");
                     if CFIP_B_REGEX.is_match(line.trim()) {
                         debug!("CF-Connecting-IP match!");
@@ -637,7 +672,7 @@ fn parse_audit_file(
                     trace!("No CF-Connecting-IP header match");
                 }
 
-                if XFFIPS_B_REGEX.is_match(line.trim()) {
+                if **proxy && XFFIPS_B_REGEX.is_match(line.trim()) {
                     debug!("X-Forward-For match!");
                     // Safe to use unwrap on captures() here because we already
                     // confirmed a match above.
@@ -664,7 +699,32 @@ fn parse_audit_file(
                     }
                     continue;
                 }
-                trace!("No x-forwarded-for header match");
+
+                if REQUEST_B_REGEX.is_match(line.trim()) {
+                    debug!("Request line match!");
+                    // Safe to use unwrap on captures() here because we already
+                    // confirmed a match above.
+                    let caps = REQUEST_B_REGEX
+                        .captures(line.trim())
+                        .unwrap();
+                    trace!("{:?}", caps);
+
+                    uri = Some(caps["uri"].to_string());
+                    continue;
+                }
+
+                if HOST_B_REGEX.is_match(line.trim()) {
+                    debug!("Host line match!");
+                    // Safe to use unwrap on captures() here because we already
+                    // confirmed a match above.
+                    let caps = HOST_B_REGEX
+                        .captures(line.trim())
+                        .unwrap();
+                    trace!("{:?}", caps);
+
+                    host = Some(caps["host"].to_string());
+                    continue;
+                }
             },
             Some(Section::H) => {
                 // We're in section H.
@@ -681,10 +741,27 @@ fn parse_audit_file(
                         .unwrap();
                     trace!("{:?}", caps);
 
+                    let uri = if !caps["uri"].is_empty() {
+                        caps["uri"].to_string()
+                    } else if uri == None {
+                        String::new()
+                    } else {
+                        uri.clone().unwrap()
+                    };
+
+                    let host = if !caps["hostname"].is_empty() {
+                        caps["hostname"].to_string()
+                    } else if host == None {
+                        String::new()
+                    } else {
+                        host.clone().unwrap()
+                    };
+
                     let mut message = String::new();
-                    message.push_str("[uri ");
-                    message.push_str(caps["hostname"].to_string().as_ref());
-                    message.push_str(caps["uri"].to_string().as_ref());
+                    message.push_str("[host ");
+                    message.push_str(host.as_ref());
+                    message.push_str("] [uri ");
+                    message.push_str(uri.as_ref());
                     message.push_str("] [id ");
                     message.push_str(caps["ruleid"].to_string().as_ref());
                     message.push_str("] [msg ");
@@ -696,6 +773,16 @@ fn parse_audit_file(
             Some(Section::Z) => {
                 trace!("Processing section Z");
                 debug!("Writing log message.");
+
+                if messages.len() == 0 {
+                    let mut message = String::new();
+                    message.push_str("[host ");
+                    message.push_str(host.clone().unwrap_or("".to_string()).as_ref());
+                    message.push_str("] [uri ");
+                    message.push_str(uri.clone().unwrap_or("".to_string()).as_ref());
+                    message.push_str("] Nothing was blocked in this request!");
+                    messages.push(message);
+                }
                 let logmessage = match build_log_message(datetime, client_ip, &messages) {
                     Ok(m) => m,
                     Err(e) => {
@@ -741,6 +828,79 @@ fn parse_audit_file(
                 // We're not in a section we care about. Skip to the next line.
                 continue;
             }
+        }
+    }
+
+    if found_section {
+        Ok(())
+    } else {
+        Err(format!("Not an audit file we recognize!"))
+    }
+}
+
+// If the file exists, delete it. Then prune the parent directories until we get
+// to the top monitoring directory and delete them if they're empty.
+fn delete_audit_file(job_path: &PathBuf, input: &PathBuf) -> Result<(), String> {
+    // Can't delete a file that doesn't exist.
+    if job_path.exists() {
+        trace!("{} exists to delete!", job_path.to_string_lossy());
+        match fs::remove_file(job_path) {
+            Ok(_) => {
+                debug!("{} deleted!", job_path.to_string_lossy());
+            },
+            Err(e) => {
+                return Err(format!("{}", e));
+            }
+        }
+    }
+
+    // Start at the directory the file was in.
+    let mut current = match job_path.parent() {
+        Some(p) => p,
+        None => {
+            trace!("Could not determine parent of file!");
+            return Err("Could not determine parent of file!".to_string());
+        }
+    };
+
+    loop {
+        // If we're at the top (the original input) or the directory doesn't exist,
+        // then break out.
+        if !current.exists() || current == input {
+            // Either the directory doesn't exist, or
+            // We've reached the monitor directory.  Don't delete past here.
+            break;
+        }
+
+        // Read the contents of the directory
+        match fs::read_dir(&current) {
+            Ok(mut entries) => {
+                if entries.next().is_none() {
+                    trace!("{} empty! Deleting", current.to_string_lossy());
+                    // It's empty
+                    match fs::remove_dir(&current) {
+                        Ok(_) => {
+                            debug!("{} deleted", current.to_string_lossy());
+                        },
+                        Err(e) => {
+                            return Err(format!("{:?}", e));
+                        }
+                    }
+                } else {
+                    // Not empty stop pruning
+                    break;
+                }
+            }
+            Err(e) => {
+                return Err(format!("{:?}", e));
+            }
+        }
+
+        // Move up
+        if let Some(parent) = current.parent() {
+            current = parent;
+        } else {
+            break;
         }
     }
 
